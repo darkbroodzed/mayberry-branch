@@ -105,3 +105,17 @@ Config is stored at `~/.mayberry/branch.json`.
 ## License
 
 MIT
+
+## Container (Podman)
+
+Images for `linux/amd64` and `linux/arm64` are built by GitHub Actions and published to `ghcr.io/<owner>/mayberry-branch` for each published release (tags: the version, e.g. `0.8.32`, and `latest`).
+
+```sh
+podman run -d --name mayberry \
+  -p 1950:1950 \
+  -v mayberry-data:/data \
+  -v /path/to/epubs:/library:ro,Z \
+  ghcr.io/darkbroodzed/mayberry-branch:latest
+```
+
+Then open `http://localhost:1950` to finish setup. Build locally with `podman build -t mayberry -f Containerfile .`

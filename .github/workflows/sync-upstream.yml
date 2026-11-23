@@ -1,0 +1,72 @@
+name: Sync upstream
+
+# Keeps this fork's main branch in sync with the original repository and
+# starts an image build for every new upstream release that has no image yet.
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write   # update main
+  actions: write    # dispatch container.yml
+  packages: read    # check which images already exist
+
+env:
+  UPSTREAM: SoFriendly/mayberry-branch
+  BRANCH: main
+  RELEASES_TO_CHECK: 3
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Never run in the upstream repository itself.
+    if: github.repository != 'SoFriendly/mayberry-branch'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Merge upstream into main
+        env:
+          # Optional SYNC_TOKEN (PAT with "workflow" scope) is only needed if
+          # upstream ever changes files under .github/workflows.
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          set -uo pipefail
+          if out=$(gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch="$BRANCH" 2>&1); then
+            echo "$out"
+            echo "### Sync: $(echo "$out" | jq -r .message)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "$out"
+            if grep -q "409" <<<"$out"; then
+              echo "::error::Merge conflict with $UPSTREAM/$BRANCH. Resolve it manually (Sync fork > Update branch, or merge locally)."
+            else
+              echo "::error::Sync failed. If upstream changed workflow files, add a SYNC_TOKEN secret (PAT with repo + workflow scopes)."
+            fi
+            exit 1
+          fi
+
+      - name: Build images for new upstream releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REG_USER: ${{ github.actor }}
+          REG_PASS: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mayberry-branch"
+          tags=$(gh release list --repo "$UPSTREAM" --exclude-drafts --exclude-pre-releases \
+                   --limit "$RELEASES_TO_CHECK" --json tagName -q '.[].tagName')
+          [[ -z "$tags" ]] && { echo "No releases in $UPSTREAM"; exit 0; }
+
+          for tag in $tags; do
+            version="${tag#v}"
+            if skopeo inspect --raw --creds "$REG_USER:$REG_PASS" "docker://$IMAGE:$version" >/dev/null 2>&1; then
+              echo "✓ $IMAGE:$version already exists"
+            else
+              echo "→ dispatching build for $tag"
+              gh workflow run container.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH" \
+                -f tag="$tag" -f source_repo="$UPSTREAM"
+              echo "- Build started for \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done

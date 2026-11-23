@@ -1,0 +1,118 @@
+name: Container image
+
+# Builds the Podman/OCI image ONLY for published releases:
+#  - a release published in this repository (release event), or
+#  - an upstream release, dispatched automatically by sync-upstream.yml
+#    (or started by hand from the Actions tab with a tag).
+# Runs on free GitHub-hosted runners and pushes to ghcr.io/<owner>/mayberry-branch.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, e.g. v0.8.32"
+        required: true
+      source_repo:
+        description: "Repository that owns the tag"
+        required: true
+        default: SoFriendly/mayberry-branch
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Resolve tag, source and image name
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_SRC: ${{ inputs.source_repo }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == release ]]; then
+            TAG="$RELEASE_TAG"; SRC="$GITHUB_REPOSITORY"
+          else
+            TAG="$INPUT_TAG";   SRC="$INPUT_SRC"
+          fi
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad tag '$TAG'"; exit 1; }
+          [[ "$SRC" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo "::error::bad repo '$SRC'"; exit 1; }
+
+          VERSION="${TAG#v}"
+          TAGS="$VERSION"
+          # Only move :latest when this is the source repo's newest release.
+          LATEST=$(gh release view --repo "$SRC" --json tagName -q .tagName 2>/dev/null || true)
+          [[ "$TAG" == "$LATEST" ]] && TAGS="$TAGS latest"
+
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"          # ghcr needs lowercase
+          {
+            echo "tag=$TAG"
+            echo "src=$SRC"
+            echo "version=$VERSION"
+            echo "tags=$TAGS"
+            echo "image=ghcr.io/$OWNER/mayberry-branch"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $SRC@$TAG -> ghcr.io/$OWNER/mayberry-branch:{${TAGS// /,}}"
+
+      # The Containerfile lives in this repo; the source comes from the release tag.
+      - name: Checkout build files
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.meta.outputs.src }}
+          ref: ${{ steps.meta.outputs.tag }}
+          path: src
+
+      - name: Add Containerfile to the source tree
+        run: cp ci/Containerfile ci/.containerignore src/
+
+      - name: Install QEMU for multi-arch builds
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+
+      - name: Build image (amd64 + arm64)
+        id: build
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: ${{ steps.meta.outputs.image }}
+          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64,linux/arm64
+          context: src
+          containerfiles: src/Containerfile
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          oci: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.tag }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Smoke test (amd64)
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+        run: podman run --rm --platform linux/amd64 "$IMAGE" version
+
+      - name: Push to GHCR
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ steps.build.outputs.image }}
+          tags: ${{ steps.build.outputs.tags }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
